@@ -1,10 +1,12 @@
 package main
 
 import (
-	"io/ioutil"
+	"database/sql"
+	"log"
+	"os"
+	"path/filepath"
 
-	"crawshaw.io/sqlite"
-	"crawshaw.io/sqlite/sqlitex"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type Settings struct {
@@ -21,62 +23,67 @@ type Item struct {
 }
 
 func dbInit(path string) error {
+	log.Println("database: opening:", path)
 	var err error
-	db, err = sqlite.OpenConn(path, 0)
+	err = os.MkdirAll(filepath.Dir(path), os.ModePerm)
 	if err != nil {
 		return err
 	}
-	err = sqlitex.Exec(db, "create table if not exists settings (version int, username text, password_check blob, last_sync int);", nil)
+	db, err = sql.Open("sqlite3", path)
+	db.SetMaxOpenConns(1)
+	log.Println("database: opened", err)
 	if err != nil {
 		return err
 	}
-	return sqlitex.Exec(db, "create table if not exists items (id int primary key, rev int, data blob);", nil)
+	_, err = db.Exec("create table if not exists settings (version int, username text, password_check blob, last_sync int);")
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec("create table if not exists items (id int primary key, rev int, data blob);")
+	return err
 }
 
 func settingsLoad() (*Settings, error) {
 	settings := &Settings{}
-	fn := func(stmt *sqlite.Stmt) error {
-		settings.Version = stmt.ColumnInt64(0)
-		settings.Username = stmt.ColumnText(1)
-		settings.PasswordCheck, _ = ioutil.ReadAll(stmt.ColumnReader(2))
-		settings.LastSync = stmt.ColumnInt64(3)
-		return nil
+	row := db.QueryRow("select version, username, password_check, last_sync from settings limit 1;")
+	err := row.Scan(&settings.Version, &settings.Username, &settings.PasswordCheck, &settings.LastSync)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
 	}
-	err := sqlitex.Exec(db, "select version, username, password_check, last_sync from settings limit 1;", fn)
-	if err == nil && settings.Version == 0 {
+	if settings.Version == 0 {
 		settings.Version = 1
 		sql := "insert into settings (version, username, password_check, last_sync) values (?, ?, ?, ?);"
-		if err := sqlitex.Exec(db, sql, nil, 1, "", []byte{}, 0); err != nil {
-			return settings, err
+		if _, err := db.Exec(sql, 1, "", []byte{}, 0); err != nil {
+			return nil, err
 		}
 	}
-	return settings, err
+	return settings, nil
 }
 
 func settingsSave(s *Settings) error {
-	return sqlitex.Exec(db, "update settings set version = ?, username = ?, password_check = ?, last_sync = ?;",
-		nil, s.Version, s.Username, s.PasswordCheck, s.LastSync)
+	_, err := db.Exec("update settings set version = ?, username = ?, password_check = ?, last_sync = ?;",
+		s.Version, s.Username, s.PasswordCheck, s.LastSync)
+	return err
 }
 
 func itemsLoad(key []byte) ([]*Item, error) {
 	items := []*Item{}
-	fn := func(stmt *sqlite.Stmt) error {
-		i := &Item{}
-		i.ID = stmt.ColumnInt64(0)
-		i.Rev = stmt.ColumnInt64(1)
-		data, err := ioutil.ReadAll(stmt.ColumnReader(2))
-		if err != nil {
-			return err
-		}
-		i.Data = textDecrypt(key, data)
-		items = append(items, i)
-		return nil
+	rows, err := db.Query("select id, rev, data from items;")
+	if err != nil {
+		return nil, err
 	}
-	err := sqlitex.Exec(db, "select id, rev, data from items;", fn)
-	return items, err
+	for rows.Next() {
+		item := &Item{}
+		data := []byte{}
+		err = rows.Scan(&item.ID, &item.Rev, &data)
+		item.Data = textDecrypt(key, data)
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 func itemsSave(key []byte, i *Item) error {
-	return sqlitex.Exec(db, "insert into items (id, rev, data) values (?, ?, ?) on conflict (id) do update set data = excluded.data;",
-		nil, i.ID, i.Rev, textEncrypt(key, i.Data))
+	_, err := db.Exec("insert into items (id, rev, data) values (?, ?, ?) on conflict (id) do update set data = excluded.data;",
+		i.ID, i.Rev, textEncrypt(key, i.Data))
+	return err
 }

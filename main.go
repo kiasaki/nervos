@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/gob"
 	"encoding/hex"
 	"fmt"
@@ -11,15 +12,17 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"crawshaw.io/sqlite"
+	_ "embed"
+
 	"gioui.org/app"
-	"gioui.org/font/gofont"
+	"gioui.org/font/opentype"
 	"gioui.org/io/key"
 	"gioui.org/io/system"
 	"gioui.org/layout"
@@ -42,10 +45,13 @@ var colorBg = nrgb(0xF9F9F9)
 var colorBgDark = nrgb(0xEEEEEE)
 var colorPrimary = nrgb(0x7C3AED)
 
+//go:embed support/IBMPlexMonoRegular.otf
+var ibmPlexMonoRegular []byte
+
 var apiUrl = "https://nervos.kiasaki.com"
 
 var (
-	db *sqlite.Conn
+	db *sql.DB
 
 	win        *app.Window
 	th         *material.Theme
@@ -74,11 +80,20 @@ var (
 	noteEditor         widget.Editor
 )
 
+func fonts() []text.FontFace {
+	face, err := opentype.Parse(ibmPlexMonoRegular)
+	if err != nil {
+		panic(fmt.Errorf("failed to parse font: %v", err))
+	}
+	return []text.FontFace{text.FontFace{Font: text.Font{Typeface: "Go"}, Face: face}}
+}
+
 func main() {
 	// init ui state
-	win = app.NewWindow(app.Title("nervos"),
-		app.Size(dp(1200), dp(768)), app.MinSize(dp(360), dp(360)))
-	th = material.NewTheme(gofont.Collection())
+	var options = []app.Option{app.Title("nervos"), app.NavigationColor(colorBg),
+		app.Size(dp(1200), dp(768)), app.MinSize(dp(360), dp(360))}
+	win = app.NewWindow(options...)
+	th = material.NewTheme(fonts())
 	th.Palette.ContrastBg = colorPrimary
 	page = "loading"
 	authUsernameEditor.Submit = true
@@ -100,9 +115,17 @@ func main() {
 	go func() {
 		// load initial data
 		dataDir, err := app.DataDir()
+		//dataDir, err := os.UserHomeDir()
 		check(err)
+		if runtime.GOOS == "ios" {
+			dataDir, err = os.UserHomeDir()
+			check(err)
+			dataDir = filepath.Join(dataDir, "Documents")
+		}
+		log.Println("data dir:", dataDir)
 		check(dbInit(filepath.Join(dataDir, "nervos.db")))
 		settings, err = settingsLoad()
+		log.Println("settings:", settings)
 		check(err)
 		if settings.Username == "" {
 			page = "login"
@@ -368,6 +391,7 @@ func layoutSearch(g C) {
 	layout.Flex{
 		WeightSum: float32(g.Constraints.Max.Y),
 		Axis:      layout.Vertical,
+		Spacing:   layout.SpaceEnd,
 	}.Layout(g,
 		layout.Rigid(layoutSearchBar),
 		layout.Rigid(layoutPageContent(dp(16), func(g C) D {
@@ -379,7 +403,7 @@ func layoutSearch(g C) {
 					g.Constraints.Min.X = g.Constraints.Max.X
 					return layout.Inset{Top: dp(8), Bottom: dp(8)}.Layout(g, func(g C) D {
 						return layout.Flex{Spacing: layout.SpaceBetween}.Layout(g,
-							layout.Rigid(layoutLabel(th, dp(16), preview)),
+							layout.Flexed(1, layoutLabel(th, dp(16), preview)),
 							layout.Rigid(layoutLabel(th, dp(16), updated.Format("15:04 02 01 2006"))),
 						)
 					})
@@ -392,6 +416,7 @@ func layoutNote(g C) {
 	layout.Flex{
 		WeightSum: float32(g.Constraints.Max.Y),
 		Axis:      layout.Vertical,
+		Spacing:   layout.SpaceEnd,
 	}.Layout(g,
 		layout.Rigid(layoutSearchBar),
 		layout.Rigid(layoutPageContent(dp(16), func(g C) D {
@@ -578,8 +603,8 @@ func layoutPageContent(padding unit.Value, fn func(C) D) func(C) D {
 	return func(g C) D {
 		return layout.Flex{Spacing: layout.SpaceAround}.Layout(g,
 			layout.Rigid(func(g C) D {
-				g.Constraints.Min.X = min(g.Metric.Px(dp(1000)), g.Constraints.Max.X)
-				g.Constraints.Max.X = min(g.Metric.Px(dp(1000)), g.Constraints.Max.X)
+				g.Constraints.Min.X = min(g.Metric.Px(dp(900)), g.Constraints.Max.X)
+				g.Constraints.Max.X = min(g.Metric.Px(dp(900)), g.Constraints.Max.X)
 				return layout.UniformInset(padding).Layout(g, fn)
 			}))
 	}
@@ -592,7 +617,9 @@ func layoutHeader(th *material.Theme, title string) func(C) D {
 }
 
 func layoutLabel(th *material.Theme, size unit.Value, text string) func(C) D {
-	return material.Label(th, size, text).Layout
+	l := material.Label(th, size, text)
+	l.MaxLines = 1
+	return l.Layout
 }
 
 func layoutInput(th *material.Theme, e *widget.Editor, hint string) func(C) D {

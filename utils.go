@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"log"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -51,6 +52,7 @@ func min(a, b int) int {
 
 func check(err error) {
 	if err != nil {
+		log.Println("panic:", err)
 		panic(err)
 	}
 }
