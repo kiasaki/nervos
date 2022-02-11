@@ -1,25 +1,26 @@
 package main
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
+	"bytes"
 	"crypto/sha256"
+	"encoding/gob"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"image"
 	"image/color"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"crawshaw.io/sqlite"
-	"crawshaw.io/sqlite/sqlitex"
 	"gioui.org/app"
 	"gioui.org/font/gofont"
+	"gioui.org/io/key"
 	"gioui.org/io/system"
 	"gioui.org/layout"
 	"gioui.org/op"
@@ -29,7 +30,6 @@ import (
 	"gioui.org/unit"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
-	"gioui.org/x/component"
 	"golang.org/x/crypto/pbkdf2"
 )
 
@@ -37,180 +37,552 @@ type C = layout.Context
 type D = layout.Dimensions
 
 var colorWhite = nrgb(0xFFFFFF)
+var colorBlack = nrgb(0x000000)
 var colorBg = nrgb(0xF9F9F9)
 var colorBgDark = nrgb(0xEEEEEE)
+var colorPrimary = nrgb(0x7C3AED)
 
-var db *sqlite.Conn
-var windowsWg sync.WaitGroup
+var apiUrl = "https://nervos.kiasaki.com"
+
+var (
+	db *sqlite.Conn
+
+	win        *app.Window
+	th         *material.Theme
+	layoutLock sync.Mutex
+
+	page        string
+	pageSubject interface{}
+
+	settings               *Settings
+	userHash               string
+	authKey                []byte
+	dataKey                []byte
+	items                  map[int64]*Item
+	searchResults          []*Item
+	searchIgnoreNextChange bool
+	saveChan               chan *Item
+	saveTimer              *time.Timer
+
+	authUsernameEditor widget.Editor
+	authPasswordEditor widget.Editor
+	authButtonClick    widget.Clickable
+	searchEditor       widget.Editor
+	searchList         widget.List
+	searchClicks       []widget.Clickable
+	newNoteClick       widget.Clickable
+	noteEditor         widget.Editor
+)
 
 func main() {
-	dbInit()
-	NewApp().Start()
-	go func() {
-		windowsWg.Wait()
+	// init ui state
+	win = app.NewWindow(app.Title("nervos"),
+		app.Size(dp(1200), dp(768)), app.MinSize(dp(360), dp(360)))
+	th = material.NewTheme(gofont.Collection())
+	th.Palette.ContrastBg = colorPrimary
+	page = "loading"
+	authUsernameEditor.Submit = true
+	authUsernameEditor.SingleLine = true
+	authPasswordEditor.Submit = true
+	authPasswordEditor.SingleLine = true
+	authPasswordEditor.Mask = '*'
+	searchList.Axis = layout.Vertical
+	searchEditor.Submit = true
+	searchEditor.SingleLine = true
+	noteEditor.InputHint = key.HintText
+
+	defer func() {
 		if db != nil {
 			db.Close()
 		}
-		os.Exit(0)
 	}()
+
+	go func() {
+		// load initial data
+		dataDir, err := app.DataDir()
+		check(err)
+		check(dbInit(filepath.Join(dataDir, "nervos.db")))
+		settings, err = settingsLoad()
+		check(err)
+		if settings.Username == "" {
+			page = "login"
+			authUsernameEditor.Focus()
+		} else {
+			page = "unlock"
+			authPasswordEditor.Focus()
+		}
+		win.Invalidate()
+
+		// sync
+		for {
+			if win == nil {
+				return
+			}
+			if len(dataKey) == 0 {
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			if err := syncChanges(); err != nil {
+				log.Println("error syncing:", err)
+			}
+			time.Sleep(30 * time.Second)
+		}
+	}()
+
+	go func() {
+		saveChan = make(chan *Item, 100)
+		saveTimer = time.NewTimer(time.Second)
+		lastItem := &Item{}
+		save := func(item *Item) {
+			if item.ID == 0 {
+				return
+			}
+			if err := itemsSave(dataKey, item); err != nil {
+				updateError("saving: " + err.Error())
+			}
+		}
+		for {
+			select {
+			case i := <-saveChan:
+				if lastItem.ID != i.ID {
+					save(lastItem)
+				}
+				lastItem = i
+				saveTimer.Reset(time.Second)
+			case <-saveTimer.C:
+				save(lastItem)
+			default:
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	go loop()
+
 	app.Main()
 }
 
-type App struct {
-	mx  sync.Mutex
-	win *app.Window
-	th  *material.Theme
-
-	username  string
-	userHash  string
-	authKey   []byte
-	dataKey   []byte
-	notes     []*Item
-	passwords []*Item
-
-	sidebar         widget.List
-	sidebarClicks   []widget.Clickable
-	sidebarSplit    component.Resize
-	replyEditor     widget.Editor
-	newAccountClick widget.Clickable
-
-	loginUsernameEditor widget.Editor
-	loginPasswordEditor widget.Editor
-	loginButtonClick    widget.Clickable
-}
-
-func NewApp() *App {
-	a := &App{}
-	a.win = app.NewWindow(
-		app.Title("nervos"),
-		app.Size(dp(1200), dp(768)),
-	)
-	a.th = material.NewTheme(gofont.Collection())
-	a.th.Palette.ContrastBg = nrgb(0x7C3AED)
-
-	a.sidebar.Axis = layout.Vertical
-	a.sidebarClicks = make([]widget.Clickable, 1)
-	a.sidebarSplit.Ratio = 0.2
-
-	a.loginUsernameEditor.SingleLine = true
-	a.loginPasswordEditor.SingleLine = true
-	a.loginPasswordEditor.Mask = '*'
-	return a
-}
-
-func (a *App) Start() {
-	go func() {
-		var err error
-		a.notes, err = itemsLoad(a.dataKey, "notes", a.userHash)
-		check(err)
-		for {
-			if a.win == nil {
-				return
+func syncChanges() error {
+	changes := []Item{}
+	for _, i := range items {
+		if i.Rev > settings.LastSync {
+			changes = append(changes, *i)
+		}
+	}
+	var bs bytes.Buffer
+	var err error
+	var req *http.Request
+	var res *http.Response
+	var updates []Item
+	err = gob.NewEncoder(&bs).Encode(changes)
+	if err != nil {
+		return err
+	}
+	req, err = http.NewRequest("POST", apiUrl, &bs)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("userhash", userHash)
+	req.Header.Set("passkey", hex.EncodeToString(authKey))
+	req.Header.Set("checkpoint", strconv.FormatInt(settings.LastSync, 10))
+	res, err = http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != 200 {
+		err = fmt.Errorf("non 200 status code: %d", res.StatusCode)
+		return err
+	}
+	err = gob.NewDecoder(res.Body).Decode(&updates)
+	if err != nil {
+		return err
+	}
+	for _, remotei := range updates {
+		if locali, ok := items[remotei.ID]; ok {
+			if remotei.Rev > locali.Rev {
+				var ii = remotei
+				items[ii.ID] = &ii
+				itemsSave(dataKey, &ii)
 			}
-			time.Sleep(1 * time.Second)
+		} else {
+			var ii = remotei
+			items[ii.ID] = &ii
+			itemsSave(dataKey, &ii)
 		}
-	}()
-	go func() {
-		windowsWg.Add(1)
-		defer windowsWg.Done()
-		err := a.runLoop()
-		if err != nil {
-			log.Fatalln(err)
-		}
-	}()
+	}
+	settings.LastSync, err = strconv.ParseInt(res.Header.Get("checkpoint"), 10, 64)
+	if err != nil {
+		return err
+	}
+	settingsSave(settings)
+
+	log.Printf("synced %d changes, %d updates", len(changes), len(updates))
+	return nil
 }
 
-func (a *App) runLoop() error {
+func loop() {
+	defer func() {
+		if err := recover(); err != nil {
+			updateError(fmt.Sprintf("panic: %v", err))
+			go loop()
+		}
+	}()
+
 	var ops op.Ops
 	for {
-		e := <-a.win.Events()
+		e := <-win.Events()
 		switch e := e.(type) {
 		case system.DestroyEvent:
-			return e.Err
+			win = nil
+			if db != nil {
+				db.Close()
+			}
+			if e.Err != nil {
+				log.Println(e.Err)
+				os.Exit(1)
+			}
+			os.Exit(0)
 		case system.FrameEvent:
-			a.Update()
 			gtx := layout.NewContext(&ops, e)
-			a.Layout(gtx)
+			layoutApp(gtx)
 			e.Frame(gtx.Ops)
+		case key.Event:
+			updateKey(e)
 		}
 	}
 }
 
-func (a *App) Update() {
-	if a.loginButtonClick.Clicked() {
-		a.username = a.loginUsernameEditor.Text()
-		userHash := sha256.Sum256([]byte(a.username))
-		a.userHash = hex.EncodeToString(userHash[:])
-		a.authKey = pbkdf2.Key(
-			[]byte(a.loginPasswordEditor.Text()),
-			[]byte("auth:"+a.userHash),
-			100000, 32, sha256.New)
-		a.dataKey = pbkdf2.Key(
-			[]byte(a.loginPasswordEditor.Text()),
-			[]byte("data:"+a.userHash),
-			100000, 32, sha256.New)
+func layoutApp(g C) {
+	// update
+	if authButtonClick.Clicked() {
+		updateLoginOrUnlock()
 	}
-	if a.newAccountClick.Clicked() {
-		log.Println("cliced")
-	}
-	for i := range a.sidebarClicks {
-		if a.sidebarClicks[i].Clicked() {
+	for _, e := range append(authUsernameEditor.Events(), authPasswordEditor.Events()...) {
+		if _, ok := e.(widget.SubmitEvent); ok {
+			updateLoginOrUnlock()
 		}
+	}
+	if newNoteClick.Clicked() {
+		updateNoteNew()
+	}
+	for _, e := range searchEditor.Events() {
+		if _, ok := e.(widget.SubmitEvent); ok {
+			if len(searchResults) > 0 {
+				updateGoToNote(searchResults[0])
+			}
+		}
+		if _, ok := e.(widget.ChangeEvent); ok {
+			if searchIgnoreNextChange {
+				searchIgnoreNextChange = false
+				break
+			}
+			updateGoToSearch()
+		}
+	}
+	for i := range searchClicks {
+		if searchClicks[i].Clicked() {
+			updateGoToNote(searchResults[i])
+		}
+	}
+	for _, e := range noteEditor.Events() {
+		if _, ok := e.(widget.ChangeEvent); ok {
+			updateNoteSave()
+		}
+	}
+
+	layoutLock.Lock()
+	defer layoutLock.Unlock()
+
+	// layout page
+	if page == "loading" {
+		layoutLoading(g)
+	}
+	if page == "error" {
+		layoutError(g)
+	}
+	if page == "login" {
+		layoutLogin(g)
+	}
+	if page == "unlock" {
+		layoutUnlock(g)
+	}
+	if page == "search" {
+		layoutSearch(g)
+	}
+	if page == "note" {
+		layoutNote(g)
 	}
 }
 
-func (a *App) Layout(gtx C) {
-	layout.Stack{Alignment: layout.Center}.Layout(gtx,
-		layout.Stacked(func(gtx C) D {
-			gtx.Constraints.Max.X = 360
-			return layout.UniformInset(dp(8)).Layout(gtx, func(gtx C) D {
-				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-					layout.Rigid(layoutHeader(a.th, "Login")),
+func layoutLoading(g C) {
+	layout.Stack{Alignment: layout.Center}.Layout(g,
+		layout.Stacked(layoutLabel(th, dp(16), "Loading...")))
+}
+
+func layoutError(g C) {
+	layout.Stack{Alignment: layout.Center}.Layout(g,
+		layout.Stacked(layoutLabel(th, dp(18), "ERROR: "+pageSubject.(string))))
+}
+
+func layoutLogin(g C) {
+	layout.Stack{Alignment: layout.Center}.Layout(g,
+		layout.Stacked(func(g C) D {
+			g.Constraints.Max.X = g.Metric.Px(dp(360))
+			return layout.UniformInset(dp(8)).Layout(g, func(g C) D {
+				return layout.Flex{Axis: layout.Vertical}.Layout(g,
+					layout.Rigid(layoutHeader(th, "Login")),
 					layout.Rigid(layout.Spacer{Height: dp(16)}.Layout),
-					layout.Rigid(material.Label(a.th, dp(14), "Username").Layout),
+					layout.Rigid(layoutLabel(th, dp(14), "Username")),
 					layout.Rigid(layout.Spacer{Height: dp(4)}.Layout),
-					layout.Rigid(layoutInput(a.th, &a.loginUsernameEditor, "")),
+					layout.Rigid(layoutInput(th, &authUsernameEditor, "")),
 					layout.Rigid(layout.Spacer{Height: dp(8)}.Layout),
-					layout.Rigid(material.Label(a.th, dp(14), "Password").Layout),
+					layout.Rigid(layoutLabel(th, dp(14), "Password")),
 					layout.Rigid(layout.Spacer{Height: dp(4)}.Layout),
-					layout.Rigid(layoutInput(a.th, &a.loginPasswordEditor, "")),
+					layout.Rigid(layoutInput(th, &authPasswordEditor, "")),
 					layout.Rigid(layout.Spacer{Height: dp(16)}.Layout),
-					layout.Rigid(layoutButton(a.th, &a.loginButtonClick, "Login")),
+					layout.Rigid(layoutButton(th, &authButtonClick, "Login")),
 					layout.Rigid(layout.Spacer{Height: dp(16)}.Layout))
 			})
 		}))
+}
 
-	/*
-			a.sidebarSplit.Layout(gtx, layoutWithBg(colorBg, func(gtx C) D {
-				return layout.Flex{
-		      WeightSum: float32(gtx.Constraints.Max.Y),
-		      Axis: layout.Vertical,
-		      Spacing: layout.SpaceBetween
-		    }.Layout(gtx,
-					layout.Rigid(func(gtx C) D {
-						return layout.UniformInset(dp(8)).Layout(gtx, func(gtx C) D {
-							listStyle := material.List(a.th, &a.sidebar)
-							return listStyle.Layout(gtx, 1, func(gtx C, i int) D {
-								labelStyle := material.Label(a.th, dp(16), "...")
-								//labelStyle.Font.Variant = "Mono"
-								return material.Clickable(gtx, &a.sidebarClicks[i], labelStyle.Layout)
-							})
-						})
-					}),
-					layout.Flexed(40, func(gtx C) D {
-						return material.Clickable(gtx, &a.newAccountClick, layoutWithBg(colorBgDark, func(gtx C) D {
-							labelStyle := material.Label(a.th, dp(16), "New Account")
-							labelStyle.Alignment = text.Middle
-							return layout.UniformInset(dp(8)).Layout(gtx, labelStyle.Layout)
-						}))
-					}))
-			}), func(gtx C) D {
-				return D{Size: gtx.Constraints.Max}
-			}, func(gtx C) D {
-				r := rLeft(cToRect(gtx.Constraints), 6)
-				return D{Size: r.Max}
+func layoutUnlock(g C) {
+	layout.Stack{Alignment: layout.Center}.Layout(g,
+		layout.Stacked(func(g C) D {
+			g.Constraints.Max.X = g.Metric.Px(dp(360))
+			return layout.UniformInset(dp(8)).Layout(g, func(g C) D {
+				return layout.Flex{Axis: layout.Vertical}.Layout(g,
+					layout.Rigid(layoutHeader(th, "Unlock")),
+					layout.Rigid(layout.Spacer{Height: dp(16)}.Layout),
+					layout.Rigid(layoutLabel(th, dp(14), "Password")),
+					layout.Rigid(layout.Spacer{Height: dp(4)}.Layout),
+					layout.Rigid(layoutInput(th, &authPasswordEditor, "")),
+					layout.Rigid(layout.Spacer{Height: dp(16)}.Layout),
+					layout.Rigid(layoutButton(th, &authButtonClick, "Unlock")),
+					layout.Rigid(layout.Spacer{Height: dp(16)}.Layout))
 			})
-	*/
+		}))
+}
+
+func layoutSearch(g C) {
+	layout.Flex{
+		WeightSum: float32(g.Constraints.Max.Y),
+		Axis:      layout.Vertical,
+	}.Layout(g,
+		layout.Rigid(layoutSearchBar),
+		layout.Rigid(layoutPageContent(dp(16), func(g C) D {
+			return material.List(th, &searchList).Layout(g, len(searchResults), func(g C, i int) D {
+				item := searchResults[i]
+				updated := idTime(item.Rev)
+				preview := strings.Replace(strings.Trim(item.Data[0:min(80, len(item.Data))], "# "), "\n", " ", -1)
+				return material.Clickable(g, &searchClicks[i], func(g C) D {
+					g.Constraints.Min.X = g.Constraints.Max.X
+					return layout.Inset{Top: dp(8), Bottom: dp(8)}.Layout(g, func(g C) D {
+						return layout.Flex{Spacing: layout.SpaceBetween}.Layout(g,
+							layout.Rigid(layoutLabel(th, dp(16), preview)),
+							layout.Rigid(layoutLabel(th, dp(16), updated.Format("15:04 02 01 2006"))),
+						)
+					})
+				})
+			})
+		})))
+}
+
+func layoutNote(g C) {
+	layout.Flex{
+		WeightSum: float32(g.Constraints.Max.Y),
+		Axis:      layout.Vertical,
+	}.Layout(g,
+		layout.Rigid(layoutSearchBar),
+		layout.Rigid(layoutPageContent(dp(16), func(g C) D {
+			g.Constraints.Min.Y = g.Metric.Px(dp(300))
+			return material.Editor(th, &noteEditor, "Note").Layout(g)
+		})))
+}
+
+func layoutSearchBar(g C) D {
+	g.Constraints.Max.Y = g.Metric.Px(dp(52))
+	return layoutWithBg(colorBg, layoutPageContent(dp(0), func(g C) D {
+		return layout.Inset{Right: dp(24)}.Layout(g, func(g C) D {
+			return layout.Flex{
+				WeightSum: float32(g.Constraints.Max.X),
+				Spacing:   layout.SpaceBetween,
+			}.Layout(g,
+				layout.Rigid(func(g C) D {
+					return layout.UniformInset(dp(16)).Layout(g, func(g C) D {
+						return material.Editor(th, &searchEditor, "Search").Layout(g)
+					})
+				}),
+				layout.Rigid(func(g C) D {
+					g.Constraints.Min.X = g.Metric.Px(dp(52))
+					g.Constraints.Max.X = g.Metric.Px(dp(52))
+					b := material.Button(th, &newNoteClick, "+")
+					b.Color = colorBlack
+					b.Background = colorBgDark
+					b.CornerRadius = dp(0)
+					b.TextSize = dp(28)
+					b.Inset.Top = dp(6)
+					return b.Layout(g)
+				}))
+		})
+	}))(g)
+}
+
+func updateKey(e key.Event) {
+	if e.Name == key.NameTab && authUsernameEditor.Focused() {
+		authPasswordEditor.Focus()
+	}
+	if e.Name == key.NameEscape {
+		if searchEditor.Focused() {
+			searchEditor.SetText("")
+		}
+		if noteEditor.Focused() {
+			x, _ := noteEditor.Selection()
+			noteEditor.SetCaret(x, x)
+		}
+	}
+	if e.Name == "L" && e.Modifiers.Contain(key.ModCommand) {
+		searchEditor.SetCaret(len(searchEditor.Text()), 0)
+		updateGoToSearch()
+	}
+	if e.Name == "N" && e.Modifiers.Contain(key.ModCommand) {
+		updateNoteNew()
+	}
+}
+
+func updateError(message string) {
+	page = "error"
+	pageSubject = message
+	win.Invalidate()
+}
+
+func updateLoginOrUnlock() {
+	if page == "login" {
+		updateLogin()
+	}
+	if page == "unlock" {
+		updateUnlock()
+	}
+}
+
+func updateLogin() {
+	settings.Username = authUsernameEditor.Text()
+	updateUnlock()
+}
+
+func updateUnlock() {
+	password := []byte(authPasswordEditor.Text())
+	authPasswordEditor.SetText("")
+
+	go func() {
+		userHashBs := sha256.Sum256([]byte(settings.Username))
+		userHash = hex.EncodeToString(userHashBs[:])
+		authKey = pbkdf2.Key(password, []byte("auth:"+userHash), 100000, 32, sha256.New)
+		dataKey = pbkdf2.Key(password, []byte("data:"+userHash), 100000, 32, sha256.New)
+
+		if len(settings.PasswordCheck) == 0 {
+			settings.PasswordCheck = textEncrypt(dataKey, userHash)
+			settingsSave(settings)
+		} else {
+			if bytes.Compare(settings.PasswordCheck, textEncrypt(dataKey, userHash)) != 0 {
+				updateError("wrong password")
+				go func() {
+					time.Sleep(600 * time.Millisecond)
+					page = "unlock"
+					authPasswordEditor.Focus()
+					win.Invalidate()
+				}()
+				return
+			}
+		}
+
+		var err error
+		allItems, err := itemsLoad(dataKey)
+		if err != nil {
+			updateError(err.Error())
+			return
+		}
+		items = map[int64]*Item{}
+		for _, i := range allItems {
+			if i.Data == "" {
+				continue
+			}
+			items[i.ID] = i
+		}
+		updateGoToSearch()
+	}()
+}
+
+func updateGoToSearch() {
+	layoutLock.Lock()
+	defer layoutLock.Unlock()
+	page = "search"
+	searchEditor.Focus()
+	searchResults = []*Item{}
+	query := strings.ToLower(searchEditor.Text())
+	for _, i := range items {
+		if query == "" ||
+			strconv.FormatInt(i.ID, 10) == query ||
+			strings.Contains(strings.ToLower(i.Data), query) {
+			searchResults = append(searchResults, i)
+		}
+	}
+	sort.Slice(searchResults, func(i, j int) bool {
+		return searchResults[i].Rev > searchResults[j].Rev
+	})
+	searchClicks = make([]widget.Clickable, len(searchResults))
+	win.Invalidate()
+}
+
+func updateGoToNote(i *Item) {
+	layoutLock.Lock()
+	defer layoutLock.Unlock()
+	searchIgnoreNextChange = true
+	searchEditor.SetText(strconv.FormatInt(i.ID, 10))
+	page = "note"
+	pageSubject = i
+	noteEditor.SetText(i.Data)
+	noteEditor.SetCaret(len(i.Data), len(i.Data))
+	noteEditor.Focus()
+	win.Invalidate()
+}
+
+func updateNoteNew() {
+	item := &Item{}
+	item.ID = id()
+	item.Rev = item.ID
+	check(itemsSave(dataKey, item))
+	items[item.ID] = item
+	page = "note"
+	pageSubject = item
+	noteEditor.SetText("")
+	noteEditor.Focus()
+	win.Invalidate()
+}
+
+func updateNoteSave() {
+	if page != "note" {
+		return
+	}
+	item := pageSubject.(*Item)
+	text := noteEditor.Text()
+	if item.Data == text {
+		return
+	}
+	item.Rev = id()
+	item.Data = text
+	saveChan <- item
+}
+
+func layoutPageContent(padding unit.Value, fn func(C) D) func(C) D {
+	return func(g C) D {
+		return layout.Flex{Spacing: layout.SpaceAround}.Layout(g,
+			layout.Rigid(func(g C) D {
+				g.Constraints.Min.X = min(g.Metric.Px(dp(1000)), g.Constraints.Max.X)
+				g.Constraints.Max.X = min(g.Metric.Px(dp(1000)), g.Constraints.Max.X)
+				return layout.UniformInset(padding).Layout(g, fn)
+			}))
+	}
 }
 
 func layoutHeader(th *material.Theme, title string) func(C) D {
@@ -219,12 +591,16 @@ func layoutHeader(th *material.Theme, title string) func(C) D {
 	return l.Layout
 }
 
+func layoutLabel(th *material.Theme, size unit.Value, text string) func(C) D {
+	return material.Label(th, size, text).Layout
+}
+
 func layoutInput(th *material.Theme, e *widget.Editor, hint string) func(C) D {
-	return func(gtx C) D {
-		gtx.Constraints.Max.Y = 36
+	return func(g C) D {
+		g.Constraints.Max.Y = g.Metric.Px(dp(36))
 		return layoutWithBg(colorBgDark, func(gtx C) D {
 			return layout.UniformInset(dp(8)).Layout(gtx, material.Editor(th, e, hint).Layout)
-		})(gtx)
+		})(g)
 	}
 }
 
@@ -250,115 +626,4 @@ func layoutWithBg(bg color.NRGBA, w func(C) D) func(C) D {
 			}),
 			layout.Expanded(w))
 	}
-}
-
-func dbInit() {
-	dataDir, err := app.DataDir()
-	check(err)
-	db, err = sqlite.OpenConn(filepath.Join(dataDir, "nervos.db"), 0)
-	check(err)
-	check(sqlitex.Exec(db, "create table if not exists items (id int primary key, parent int, type text, created int, updated int, metadata blob, data blob);", nil))
-	check(sqlitex.Exec(db, "create index if not exists items_parent on items (parent);", nil))
-}
-
-type Item struct {
-	ID       string
-	Parent   string
-	Type     string
-	Created  time.Time
-	Updated  time.Time
-	Metadata map[string]interface{}
-	Data     map[string]interface{}
-}
-
-func itemsLoad(key []byte, typ, parent string) ([]*Item, error) {
-	items := []*Item{}
-	fn := func(stmt *sqlite.Stmt) error {
-		i := &Item{}
-		i.ID = stmt.ColumnText(0)
-		i.Parent = stmt.ColumnText(1)
-		i.Type = stmt.ColumnText(2)
-		i.Created = time.Unix(stmt.ColumnInt64(3), 0)
-		i.Updated = time.Unix(stmt.ColumnInt64(4), 0)
-		metadata := []byte{}
-		stmt.ColumnBytes(5, metadata)
-		if err := json.Unmarshal([]byte(metadata), &i.Metadata); err != nil {
-			return err
-		}
-		data := []byte{}
-		stmt.ColumnBytes(6, data)
-		mustCipher(key).Decrypt(data, data)
-		return json.Unmarshal([]byte(data), &i.Data)
-	}
-	err := sqlitex.Exec(db, "select id, parent, type, created, updated, metadata, data from items where type = ? and parent = ?;", fn, typ, parent)
-	return items, err
-}
-
-func itemSave(key []byte, i *Item) error {
-	metadata, err := json.Marshal(i.Metadata)
-	if err != nil {
-		return err
-	}
-	data, err := json.Marshal(i.Data)
-	if err != nil {
-		return err
-	}
-	mustCipher(key).Encrypt(data, data)
-	return sqlitex.Exec(db, "insert into items (id, parent, type, created, updated, metadata, data) values (?, ?, ?, ?, ?, ?, ?) on conflict (id) do update set created = excluded.created, updated = excluded.updated, metadata = excluded.metadata, data = excluded.data;",
-		nil, i.ID, i.Parent, i.Type, i.Created, i.Updated, string(metadata), string(data))
-}
-
-func mustCipher(key []byte) cipher.Block {
-	c, err := aes.NewCipher(key)
-	check(err)
-	return c
-}
-
-func dp(v float32) unit.Value {
-	return unit.Dp(v)
-}
-
-func nrgb(c uint32) color.NRGBA {
-	return nargb(0xff000000 | c)
-}
-
-func nargb(c uint32) color.NRGBA {
-	return color.NRGBA{A: uint8(c >> 24), R: uint8(c >> 16), G: uint8(c >> 8), B: uint8(c)}
-}
-
-func cToRect(c layout.Constraints) image.Rectangle {
-	return image.Rectangle{Min: c.Min, Max: c.Max}
-}
-
-func rLeft(r image.Rectangle, n int) image.Rectangle {
-	return image.Rect(r.Min.X, r.Min.Y, r.Min.X+n, r.Max.Y)
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func check(err error) {
-	if err != nil {
-		panic(err)
-	}
-}
-
-func uuid() string {
-	u := [16]byte{}
-	_, err := rand.Read(u[:16])
-	if err != nil {
-		panic(err)
-	}
-	return fmt.Sprintf("%x", u)
 }
