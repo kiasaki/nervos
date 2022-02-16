@@ -48,6 +48,9 @@ var colorPrimary = nrgb(0x7C3AED)
 //go:embed support/IBMPlexMonoRegular.otf
 var ibmPlexMonoRegular []byte
 
+//go:embed support/IBMPlexMonoBold.otf
+var ibmPlexMonoBold []byte
+
 var apiUrl = "https://nervos.kiasaki.com"
 
 var (
@@ -85,13 +88,24 @@ func fonts() []text.FontFace {
 	if err != nil {
 		panic(fmt.Errorf("failed to parse font: %v", err))
 	}
-	return []text.FontFace{text.FontFace{Font: text.Font{Typeface: "Go"}, Face: face}}
+	faceBold, err := opentype.Parse(ibmPlexMonoBold)
+	if err != nil {
+		panic(fmt.Errorf("failed to parse font: %v", err))
+	}
+	return []text.FontFace{
+		text.FontFace{Font: text.Font{Typeface: "Go"}, Face: face},
+		text.FontFace{Font: text.Font{Typeface: "Go", Weight: text.Bold}, Face: faceBold},
+	}
 }
 
 func main() {
 	// init ui state
 	var options = []app.Option{app.Title("nervos"), app.NavigationColor(colorBg),
 		app.Size(dp(1200), dp(768)), app.MinSize(dp(360), dp(360))}
+	if runtime.GOOS == "ios" {
+		options = append(options, app.Decorated(false))
+		options = append(options, app.Fullscreen.Option())
+	}
 	win = app.NewWindow(options...)
 	th = material.NewTheme(fonts())
 	th.Palette.ContrastBg = colorPrimary
@@ -226,6 +240,9 @@ func syncChanges() error {
 				var ii = remotei
 				items[ii.ID] = &ii
 				itemsSave(dataKey, &ii)
+				if page == "note" && pageSubject.(*Item).ID == ii.ID {
+					noteEditor.SetText(ii.Data)
+				}
 			}
 		} else {
 			var ii = remotei
@@ -398,14 +415,23 @@ func layoutSearch(g C) {
 			return material.List(th, &searchList).Layout(g, len(searchResults), func(g C, i int) D {
 				item := searchResults[i]
 				updated := idTime(item.Rev)
-				preview := strings.Replace(strings.Trim(item.Data[0:min(80, len(item.Data))], "# "), "\n", " ", -1)
+				lines := strings.Split(item.Data, "\n")
+				rest := strings.Join(lines[min(len(lines)-1, 1):], " ")
+				rest = strings.Replace(rest, "  ", " ", -1)
+				rest = strings.Replace(rest, "  ", " ", -1)
+				title := strings.Trim(lines[0], "# ")
+				preview := rest[0:min(80, len(rest))]
 				return material.Clickable(g, &searchClicks[i], func(g C) D {
 					g.Constraints.Min.X = g.Constraints.Max.X
 					return layout.Inset{Top: dp(8), Bottom: dp(8)}.Layout(g, func(g C) D {
 						return layout.Flex{Spacing: layout.SpaceBetween}.Layout(g,
 							layout.Flexed(1, layoutLabel(th, dp(16), preview)),
-							layout.Rigid(layoutLabel(th, dp(16), updated.Format("15:04 02 01 2006"))),
-						)
+							layout.Rigid(func(g C) D {
+								return layout.Flex{}.Layout(g,
+									layout.Rigid(layoutLabel(th, dp(16), updated.Format("2006-01-02 15:04 "))),
+									layout.Rigid(layoutLabelBold(th, dp(16), title+" ")),
+									layout.Flexed(1, layoutLabel(th, dp(16), rest)))
+							}))
 					})
 				})
 			})
@@ -563,7 +589,7 @@ func updateGoToNote(i *Item) {
 	layoutLock.Lock()
 	defer layoutLock.Unlock()
 	searchIgnoreNextChange = true
-	searchEditor.SetText(strconv.FormatInt(i.ID, 10))
+	searchEditor.SetText("")
 	page = "note"
 	pageSubject = i
 	noteEditor.SetText(i.Data)
@@ -616,8 +642,15 @@ func layoutHeader(th *material.Theme, title string) func(C) D {
 	return l.Layout
 }
 
-func layoutLabel(th *material.Theme, size unit.Value, text string) func(C) D {
-	l := material.Label(th, size, text)
+func layoutLabel(th *material.Theme, size unit.Value, s string) func(C) D {
+	l := material.Label(th, size, s)
+	l.MaxLines = 1
+	return l.Layout
+}
+
+func layoutLabelBold(th *material.Theme, size unit.Value, s string) func(C) D {
+	l := material.Label(th, size, s)
+	l.Font.Weight = text.Bold
 	l.MaxLines = 1
 	return l.Layout
 }
